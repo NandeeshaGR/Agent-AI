@@ -267,15 +267,22 @@ def create_csv_agent():
 
     api_key = os.getenv("GROQ_API_KEY")
 
-    if not api_key:
-        raise ValueError(
-            "GROQ_API_KEY is missing from your .env file."
-        )
+if not api_key:
+    try:
+        api_key = st.secrets["GROQ_API_KEY"]
+    except Exception:
+        api_key = None
 
-    llm = ChatGroq(
-        model="openai/gpt-oss-20b",
-        temperature=0
+if not api_key:
+    raise ValueError(
+        "GROQ_API_KEY is missing. Configure it in .env or Streamlit Secrets."
     )
+
+llm = ChatGroq(
+    model="openai/gpt-oss-20b",
+    temperature=0,
+    api_key=api_key
+)
 
     agent = create_agent(
         model=llm,
