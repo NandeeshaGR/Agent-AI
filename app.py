@@ -1,5 +1,4 @@
 import os
-import ast
 import uuid
 import pandas as pd
 import streamlit as st
@@ -18,271 +17,245 @@ st.set_page_config(
     layout="wide"
 )
 
-_df: pd.DataFrame | None = None
+
+def get_api_key():
+    api_key = os.getenv("GROQ_API_KEY")
+
+    if not api_key:
+        try:
+            api_key = st.secrets["GROQ_API_KEY"]
+        except Exception:
+            api_key = None
+
+    return api_key
 
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-if "thread_id" not in st.session_state:
-    st.session_state.thread_id = str(uuid.uuid4())
-
 if "memory" not in st.session_state:
     st.session_state.memory = InMemorySaver()
 
+if "thread_id" not in st.session_state:
+    st.session_state.thread_id = str(uuid.uuid4())
 
-def set_df(df: pd.DataFrame):
-    global _df
-    _df = df
+if "df" not in st.session_state:
+    st.session_state.df = None
 
-
-
-@tool
-def get_data_info():
-    """
-    Get columns, data types, shape,
-    and first 5 rows of the uploaded CSV.
-    """
-
-    if _df is None:
-        return "No CSV loaded."
-
-    if _df.empty:
-        return "The CSV contains no rows."
-
-    return f"""
-    Shape: {_df.shape}
-
-    Columns and Types:
-    {_df.dtypes.to_string()}
-
-    First 5 Rows:
-    {_df.head().to_string()}
-    """
+if "file_signature" not in st.session_state:
+    st.session_state.file_signature = None
 
 
+def create_csv_agent(df):
 
-@tool
-def filter_tool(condition: str):
-    """
-    Filter rows using a pandas query condition.
+    api_key = get_api_key()
 
-    Example:
-    Age > 30 and Department == 'Engineering'
-    """
-
-    if _df is None:
-        return "No CSV loaded."
-
-    if _df.empty:
-        return "The CSV contains no rows."
-
-    try:
-
-        result = _df.query(condition)
-
-        return (
-            f"Found {len(result)} rows:\n"
-            f"{result.to_string()}"
+    if not api_key:
+        raise ValueError(
+            "GROQ_API_KEY is missing. Configure it in .env or Streamlit Secrets."
         )
 
-    except Exception as e:
+    @tool
+    def get_data_info() -> str:
+        """Get dataset shape, column names, data types, missing values and sample records."""
 
-        return f"Error filtering data: {e}"
+        return f"""
+        Dataset Information:
 
+        Total Rows: {df.shape[0]}
 
-ALLOWED_METHODS = {
-    "groupby",
-    "mean",
-    "median",
-    "sum",
-    "min",
-    "max",
-    "count",
-    "std",
-    "var",
-    "value_counts",
-    "nunique",
-    "describe",
-    "head",
-    "tail",
-    "sort_values",
-    "agg",
-    "size",
-    "reset_index",
-    "quantile"
-}
+        Total Columns: {df.shape[1]}
 
+        Column Names:
+        {list(df.columns)}
 
-def validate_expression(node):
+        Data Types:
+        {df.dtypes.to_string()}
 
-    if isinstance(node, ast.Expression):
+        Missing Values:
+        {df.isnull().sum().to_string()}
 
-        validate_expression(node.body)
+        First Five Records:
+        {df.head().to_string()}
+        """
 
-    elif isinstance(node, ast.Name):
+    @tool
+    def filter_data(column: str, operator: str, value: str) -> str:
+        """Filter the dataset using a column, operator and comparison value. Supported operators: ==, !=, >, <, >=, <=, contains."""
 
-        if node.id != "df":
-            raise ValueError(
-                "Only dataframe 'df' is allowed."
-            )
+        if column not in df.columns:
+            return f"Column '{column}' does not exist."
 
-    elif isinstance(node, ast.Constant):
+        series = df[column]
 
-        if not isinstance(
-            node.value,
-            (str, int, float, bool)
-        ):
-            raise ValueError("Unsupported constant.")
+        if operator == "contains":
+            result = df[
+                series.astype(str).str.contains(
+                    value,
+                    case=False,
+                    na=False,
+                    regex=False
+                )
+            ]
 
-    elif isinstance(node, ast.Subscript):
+        elif operator in ["==", "!="]:
+            numeric_value = pd.to_numeric(value, errors="coerce")
 
-        validate_expression(node.value)
-        validate_expression(node.slice)
+            if pd.api.types.is_numeric_dtype(series) and pd.notna(numeric_value):
+                comparison = series == numeric_value
+            else:
+                comparison = (
+                    series.astype(str).str.lower() == value.lower()
+                )
 
-    elif isinstance(node, ast.Attribute):
+            if operator == "!=":
+                comparison = ~comparison
 
-        if node.attr not in ALLOWED_METHODS:
-            raise ValueError(
-                "This dataframe attribute is not allowed."
-            )
+            result = df[comparison]
 
-        validate_expression(node.value)
+        elif operator in [">", "<", ">=", "<="]:
+            numeric_series = pd.to_numeric(series, errors="coerce")
 
-    elif isinstance(node, ast.Call):
+            try:
+                numeric_value = float(value)
+            except ValueError:
+                return "Please provide a numeric comparison value."
 
-        if not isinstance(node.func, ast.Attribute):
-            raise ValueError(
-                "Only approved dataframe methods are allowed."
-            )
+            if operator == ">":
+                result = df[numeric_series > numeric_value]
+            elif operator == "<":
+                result = df[numeric_series < numeric_value]
+            elif operator == ">=":
+                result = df[numeric_series >= numeric_value]
+            else:
+                result = df[numeric_series <= numeric_value]
 
-        if node.func.attr not in ALLOWED_METHODS:
-            raise ValueError(
-                "This dataframe method is not allowed."
-            )
+        else:
+            return "Unsupported operator."
 
-        validate_expression(node.func)
+        return f"""
+        Matching Rows: {len(result)}
 
-        for arg in node.args:
-            validate_expression(arg)
+        Results:
+        {result.head(20).to_string()}
+        """
 
-        for keyword in node.keywords:
-            validate_expression(keyword.value)
+    @tool
+    def analyze_data(
+        operation: str,
+        column: str,
+        group_by: str = ""
+    ) -> str:
+        """Perform statistical analysis. Supported operations: mean, median, sum, min, max, count, value_counts and describe. Optional group_by column for grouped analysis."""
 
-    elif isinstance(node, (ast.List, ast.Tuple)):
+        if column not in df.columns:
+            return f"Column '{column}' does not exist."
 
-        for element in node.elts:
-            validate_expression(element)
+        valid_operations = [
+            "mean",
+            "median",
+            "sum",
+            "min",
+            "max",
+            "count",
+            "value_counts",
+            "describe"
+        ]
 
-    elif isinstance(node, ast.Load):
+        if operation not in valid_operations:
+            return f"Unsupported operation. Choose from {valid_operations}"
 
-        pass
+        series = df[column]
 
-    else:
+        if operation in ["mean", "median", "sum"]:
+            numeric_series = pd.to_numeric(series, errors="coerce")
 
-        raise ValueError("Unsupported expression.")
+            if numeric_series.notna().sum() == 0:
+                return "This column has no usable numeric values."
 
+            if group_by:
+                if group_by not in df.columns:
+                    return f"Group column '{group_by}' does not exist."
 
-@tool
-def analyze_data(expression: str):
-    """
-    Run approved pandas expressions on dataframe df.
+                result = (
+                    df.assign(_analysis_value=numeric_series)
+                    .groupby(group_by)["_analysis_value"]
+                    .agg(operation)
+                )
 
-    Examples:
+                return result.to_string()
 
-    df['Salary'].mean()
+            return str(getattr(numeric_series, operation)())
 
-    df.groupby('Department')['Salary'].mean()
+        if operation == "min":
+            return str(series.min())
 
-    df['City'].value_counts()
-    """
+        if operation == "max":
+            return str(series.max())
 
-    if _df is None:
-        return "No CSV loaded."
+        if operation == "count":
+            return str(series.count())
 
-    if _df.empty:
-        return "The CSV contains no rows."
+        if operation == "value_counts":
+            return series.value_counts(
+                dropna=False
+            ).head(20).to_string()
 
-    try:
+        if operation == "describe":
+            return series.describe().to_string()
 
-        df = _df
+    @tool
+    def check_data_quality() -> str:
+        """Check duplicate rows, missing values and dataset quality."""
 
-        parsed = ast.parse(expression, mode="eval")
+        return f"""
+        DATA QUALITY REPORT
 
-        validate_expression(parsed)
+        Total Rows: {len(df)}
 
-        result = eval(
-            compile(parsed, "<analysis>", "eval"),
-            {"__builtins__": {}},
-            {"df": df}
-        )
+        Total Columns: {len(df.columns)}
 
-        return str(result)
+        Duplicate Rows: {df.duplicated().sum()}
 
-    except Exception as e:
+        Total Missing Values: {df.isnull().sum().sum()}
 
-        return f"Error analyzing data: {e}"
+        Missing Values By Column:
 
+        {df.isnull().sum().to_string()}
+        """
 
-all_tools = [
-    get_data_info,
-    filter_tool,
-    analyze_data
-]
+    all_tools = [
+        get_data_info,
+        filter_data,
+        analyze_data,
+        check_data_quality
+    ]
 
-
-
-system_prompt = """
-You are a professional data analyst assistant.
-
-You help users explore and analyze CSV datasets.
-
-Available tools:
-
-1. get_data_info:
-   Get columns, data types and sample rows.
-
-2. filter_tool:
-   Filter rows using pandas query conditions.
-
-3. analyze_data:
-   Perform calculations, statistics,
-   aggregations and group analysis.
-
-Instructions:
-
-- Always use get_data_info first when column names
-  or data types are unknown.
-- Use appropriate tools to answer questions.
-- Never invent statistics or results.
-- Base answers only on the uploaded dataset.
-- Explain results in simple language.
-- If a requested column does not exist,
-  inform the user.
-- Present numerical results clearly.
-"""
-
-
-def create_csv_agent():
-
-    api_key = os.getenv("GROQ_API_KEY")
-
-if not api_key:
-    try:
-        api_key = st.secrets["GROQ_API_KEY"]
-    except Exception:
-        api_key = None
-
-if not api_key:
-    raise ValueError(
-        "GROQ_API_KEY is missing. Configure it in .env or Streamlit Secrets."
+    llm = ChatGroq(
+        model="openai/gpt-oss-20b",
+        temperature=0,
+        api_key=api_key
     )
 
-llm = ChatGroq(
-    model="openai/gpt-oss-20b",
-    temperature=0,
-    api_key=api_key
-)
+    system_prompt = """
+    You are an intelligent CSV Data Analysis Agent.
+
+    Your job is to analyze the uploaded CSV dataset
+    and answer user questions accurately.
+
+    Rules:
+
+    1. Always use get_data_info first when column names or data types are unknown.
+    2. Use appropriate tools to answer questions.
+    3. Never invent statistics or results.
+    4. Base answers only on the uploaded dataset.
+    5. Explain results in simple language.
+    6. If a requested column does not exist, inform the user.
+    7. Present numerical results clearly.
+    8. Use check_data_quality for data quality questions.
+    9. Use filter_data for filtering requests.
+    10. Use analyze_data for statistical calculations.
+    """
 
     agent = create_agent(
         model=llm,
@@ -293,9 +266,10 @@ llm = ChatGroq(
 
     return agent
 
-def run_agent(query: str):
 
-    agent = create_csv_agent()
+def run_agent(query: str, df):
+
+    agent = create_csv_agent(df)
 
     response = agent.invoke(
         {
@@ -313,67 +287,121 @@ def run_agent(query: str):
         }
     )
 
-    answer = response["messages"][-1].content
+    messages = response.get("messages", [])
+
+    if not messages:
+        return "The agent did not return a response."
+
+    answer = messages[-1].content
+
+    if isinstance(answer, list):
+        answer = "\n".join(
+            item.get("text", str(item))
+            if isinstance(item, dict)
+            else str(item)
+            for item in answer
+        )
 
     return answer
 
 
-st.header("📊 CSV AI Agent")
+with st.sidebar:
 
-st.write(
-    "Upload your CSV dataset and ask questions "
-    "to analyze your data using AI."
+    st.header("📊 Available Features")
+
+    st.markdown("""
+    - 📋 Dataset Information
+    - 🔍 Data Filtering
+    - 📈 Statistical Analysis
+    - 📊 Group Analysis
+    - 🧹 Data Quality Checks
+    """)
+
+    st.divider()
+
+    st.markdown("Powered by Groq, LangChain and LangGraph.")
+
+
+st.title("📊 CSV AI Agent")
+
+st.markdown(
+    """
+    ### Intelligent CSV Data Analysis
+
+    Upload your CSV dataset and ask questions in natural language.
+    """
 )
 
+st.write("")
 
-file = st.file_uploader(
-    label="Select your CSV File",
-    type="csv"
-)
+col1, col2, col3 = st.columns([1, 2, 1])
 
-if file:
+with col2:
+    uploaded_file = st.file_uploader(
+        "📂 Upload Your CSV Dataset",
+        type=["csv"],
+        key="main_csv_uploader"
+    )
+
+st.write("")
+
+
+if uploaded_file is not None:
 
     try:
-
-        df = pd.read_csv(file)
-
-        set_df(df)
-
-        st.dataframe(df.head())
-
-        st.success(
-            f"Loaded {df.shape[0]} rows."
+        file_signature = (
+            uploaded_file.name,
+            uploaded_file.size
         )
 
+        if file_signature != st.session_state.file_signature:
+
+            df = pd.read_csv(uploaded_file)
+
+            st.session_state.df = df
+            st.session_state.file_signature = file_signature
+            st.session_state.messages = []
+            st.session_state.thread_id = str(uuid.uuid4())
+
+        else:
+            df = st.session_state.df
+
+        st.success("CSV uploaded successfully!")
+
+        st.subheader("📋 Dataset Preview")
+
+        st.dataframe(
+            df.head(10),
+            use_container_width=True
+        )
+
+        col1, col2, col3 = st.columns(3)
+
+        col1.metric("Total Rows", df.shape[0])
+        col2.metric("Total Columns", df.shape[1])
+        col3.metric("Duplicate Rows", int(df.duplicated().sum()))
+
     except Exception as e:
-
-        st.error(f"CSV loading error: {e}")
-
-
-for msg in st.session_state.messages:
-
-    role = msg["role"]
-
-    content = msg["content"]
-
-    with st.chat_message(role):
-
-        st.markdown(content)
+        st.error(f"Error reading CSV: {e}")
+        st.stop()
 
 
+if st.session_state.df is not None:
 
-if _df is not None and not _df.empty:
+    st.divider()
+
+    st.subheader("💬 Chat With Your Dataset")
+
+    for message in st.session_state.messages:
+
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
     query = st.chat_input(
-        "Ask anything about your CSV data..."
+        "Ask something about your CSV dataset..."
     )
 
     if query:
-
-
-        with st.chat_message("user"):
-
-            st.markdown(query)
 
         st.session_state.messages.append(
             {
@@ -382,28 +410,31 @@ if _df is not None and not _df.empty:
             }
         )
 
-        # Generate AI response
+        with st.chat_message("user"):
+            st.markdown(query)
 
         with st.chat_message("assistant"):
 
             with st.spinner("Analyzing your data..."):
 
                 try:
+                    answer = run_agent(
+                        query,
+                        st.session_state.df
+                    )
 
-                    res = run_agent(query)
-
-                    st.markdown(res)
+                    st.markdown(answer)
 
                     st.session_state.messages.append(
                         {
                             "role": "assistant",
-                            "content": res
+                            "content": answer
                         }
                     )
 
                 except Exception as e:
 
-                    error_message = f"Error: {e}"
+                    error_message = f"Error: {str(e)}"
 
                     st.error(error_message)
 
@@ -416,6 +447,4 @@ if _df is not None and not _df.empty:
 
 else:
 
-    st.info(
-        "Please upload a CSV file to start chatting."
-    )
+    st.info("Please upload a CSV file to start chatting.")
